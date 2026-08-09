@@ -1,0 +1,17 @@
+# 敏感文件 - 包含 DeepSeek API token
+config.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 临时截图
+_shot*.png
+*.log
+
+# IDE
+.idea/
+.vscode/
