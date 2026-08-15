@@ -1,11 +1,14 @@
 {
   "mini_mode": true,
   "full_window_pos": [
-    1065,
-    531
+    1278,
+    389,
+    1020,
+    600
   ],
   "mini_window_pos": [
-    2590,
-    1353
-  ]
+    1273,
+    1352
+  ],
+  "topmost": true
 }

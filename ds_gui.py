@@ -59,6 +59,7 @@ class UsageApp:
         # --- 迷你模式 (单行无边框条) ---
         self.mini_mode = False
         self._drag_offset = None
+        self._refreshing = False  # 刷新并发保护标志
         self.mini_frame = tk.Frame(root, bg=MINI_BG)
         self.mini_today = tk.Label(self.mini_frame, text="--", font=("Microsoft YaHei", 11, "bold"),
                                    fg="#f39c12", bg=MINI_BG)
@@ -104,7 +105,7 @@ class UsageApp:
                                                        "<ButtonRelease-1>": "_drag_end"}[ev]))
         # 右键菜单 + Esc 关闭
         self.context_menu = tk.Menu(root, tearoff=0)
-        self.context_menu.add_command(label="立即刷新", command=self.refresh)
+        self.context_menu.add_command(label="立即刷新", command=lambda: self.refresh(manual=True))
         self.context_menu.add_command(label="完整 / 迷你模式", command=self.toggle_mode)
         self.context_menu.add_command(label="置顶", command=self.toggle_topmost)
         self.context_menu.add_separator()
@@ -160,7 +161,7 @@ class UsageApp:
         # 底部
         bottom = ttk.Frame(self.full_frame, padding=10)
         bottom.pack(fill="x")
-        ttk.Button(bottom, text="立即刷新", command=self.refresh).pack(side="left")
+        ttk.Button(bottom, text="立即刷新", command=lambda: self.refresh(manual=True)).pack(side="left")
         ttk.Button(bottom, text="更新Token", command=self.update_token).pack(side="left", padx=8)
         ttk.Button(bottom, text="今日快照", command=self.snapshot).pack(side="left")
         ttk.Button(bottom, text="迷你模式", command=self.toggle_mode).pack(side="left", padx=8)
@@ -178,8 +179,7 @@ class UsageApp:
         self.root.update_idletasks()
         self.restore_position()
         self._keep_topmost()  # 置顶看门狗
-        self.refresh()
-        # 自动刷新: 每 10 分钟
+        # 启动即刷新一次, 之后每 10 分钟自动刷新 (_auto_refresh 内部会先刷一次)
         self._auto_refresh()
 
     # ---------- 迷你模式 ----------
@@ -240,26 +240,31 @@ class UsageApp:
         _save_gui_config(cfg)
 
     def save_position(self):
-        """拖动结束按当前模式分别记录位置，供下次启动/切换时恢复"""
+        """拖动结束按当前模式分别记录位置（完整模式附带窗口尺寸），供下次启动/切换时恢复"""
         key = "mini_window_pos" if self.mini_mode else "full_window_pos"
-        self._save_cfg_field(key, [self.root.winfo_x(), self.root.winfo_y()])
+        val = [self.root.winfo_x(), self.root.winfo_y()]
+        if not self.mini_mode:
+            val += [self.root.winfo_width(), self.root.winfo_height()]
+        self._save_cfg_field(key, val)
 
     def restore_position(self):
-        """恢复当前模式记录的位置（迷你/完整分开记忆）；位置超出可见工作区
+        """恢复当前模式记录的位置（迷你/完整分开记忆，完整模式含尺寸）；位置超出可见工作区
         （显示器拔掉/任务栏遮挡）时放弃。返回 True 表示已恢复。"""
         key = "mini_window_pos" if self.mini_mode else "full_window_pos"
         pos = _load_gui_config().get(key)
-        if not isinstance(pos, (list, tuple)) or len(pos) != 2:
+        if not isinstance(pos, (list, tuple)) or len(pos) not in (2, 4):
             # 兼容旧版本单一 window_pos
             pos = _load_gui_config().get("window_pos")
-        if not isinstance(pos, (list, tuple)) or len(pos) != 2:
+        if not isinstance(pos, (list, tuple)) or len(pos) not in (2, 4):
             return False
         try:
             x, y = int(pos[0]), int(pos[1])
+            w, h = (int(pos[2]), int(pos[3])) if len(pos) == 4 else (None, None)
         except (TypeError, ValueError):
             return False
         self.root.update_idletasks()
-        w, h = self.root.winfo_width(), self.root.winfo_height()
+        if w is None or h is None or self.mini_mode:
+            w, h = self.root.winfo_width(), self.root.winfo_height()
         area = self._get_work_area(x + w // 2, y + h // 2)
         if area is None:
             return False
@@ -268,7 +273,10 @@ class UsageApp:
         overlap_y = min(y + h, r_bottom) - max(y, r_top)
         if overlap_x < 60 or overlap_y < 30:
             return False  # 可能在已断开显示器上或被任务栏遮挡
-        self.root.geometry(f"+{x}+{y}")
+        if self.mini_mode:
+            self.root.geometry(f"+{x}+{y}")
+        else:
+            self.root.geometry(f"{w}x{h}+{x}+{y}")
         return True
 
     def _get_work_area(self, x, y):
@@ -341,42 +349,70 @@ class UsageApp:
         self.refresh()
         self.root.after(600_000, self._auto_refresh)
 
-    def refresh(self):
+    def refresh(self, manual=False):
+        """后台线程取数, UI 更新经 root.after 回主线程 (tkinter 非线程安全);
+        manual=True 表示用户手动触发, 失败时弹窗; 自动刷新失败只置灰不打扰"""
+        if self._refreshing:
+            return  # 防连点/自动刷新与手动刷新并发
+        self._refreshing = True
+
         def worker():
             try:
-                tok = ds_api.get_valid_token()
+                # 先直接试 config token (省一次验证请求), 失效再走 Chrome 恢复链
+                tok = ds_api.load_token()
+                s = None
+                if tok:
+                    try:
+                        s = ds_api.get_summary(tok)
+                    except ds_api.ApiError:
+                        tok = ""  # 已失效
                 if not tok:
-                    self.var_status.set("未检测到登录态，点击 更新Token 引导登录")
-                    self.root.after(0, self._maybe_guide)
-                    return
-                s = ds_api.get_summary(tok)
+                    tok = ds_api.get_valid_token()
+                    if not tok:
+                        self.root.after(0, self._on_no_token)
+                        return
+                    s = ds_api.get_summary(tok)
                 u = ds_api.get_usage(tok, 30)
                 t_start, t_end = ds_api._today_range()
                 today = ds_api.get_usage(tok, start=t_start, end=t_end)
-                self.var_balance.set(f"¥{s['balance']:.2f}")
-                self.var_cost.set(f"¥{s['total_cost']:.2f}")
-                self.var_todaycost.set(f"¥{today['total_cost']:.2f}")
-                self.var_todaycache.set(_fmt_rate(today.get("cache_rate")))
-                self.var_30cost.set(f"¥{u['total_cost']:.2f}")
-                self.var_30req.set(f"{u['total_requests']:,}")
-                self.var_30tok.set(_fmt_tokens(u['total_tokens']))
-                self._fill_table(u['rows'])
-                self.mini_today.config(text=f"¥{today['total_cost']:.2f}", fg="#f39c12")
-                self.mini_balance.config(text=f"¥{s['balance']:.2f}", fg="#2ecc71")
-                self.mini_cache.config(text=_fmt_rate(today.get("cache_rate")), fg="#26c6da")
-                self.mini_time.config(text=time.strftime("%H:%M"))
-                self.var_status.set("更新于 " + time.strftime("%H:%M:%S"))
-                if self.mini_mode:
-                    self.root.update_idletasks()
-                    w = self.mini_frame.winfo_reqwidth() + 30
-                    self.root.geometry(f"{max(w, 320)}x40")  # 数字变长时自适应宽度
+                self.root.after(0, lambda: self._apply_data(s, u, today))
             except ds_api.ApiError as e:
-                self.var_status.set("错误: " + str(e)[:60])
-                self.mini_today.config(fg="#777")   # 数据过期置灰
-                self.mini_balance.config(fg="#777")
-                self.mini_cache.config(fg="#777")
-                messagebox.showerror("获取失败", str(e))
+                self.root.after(0, lambda: self._on_refresh_error(e, manual))
+            finally:
+                self._refreshing = False
         threading.Thread(target=worker, daemon=True).start()
+
+    def _on_no_token(self):
+        self.var_status.set("未检测到登录态，点击 更新Token 引导登录")
+        self._maybe_guide()
+
+    def _apply_data(self, s, u, today):
+        """主线程应用一次刷新结果: 卡片 / 明细表 / 迷你条"""
+        self.var_balance.set(f"¥{s['balance']:.2f}")
+        self.var_cost.set(f"¥{s['total_cost']:.2f}")
+        self.var_todaycost.set(f"¥{today['total_cost']:.2f}")
+        self.var_todaycache.set(_fmt_rate(today.get("cache_rate")))
+        self.var_30cost.set(f"¥{u['total_cost']:.2f}")
+        self.var_30req.set(f"{u['total_requests']:,}")
+        self.var_30tok.set(_fmt_tokens(u['total_tokens']))
+        self._fill_table(u['rows'])
+        self.mini_today.config(text=f"¥{today['total_cost']:.2f}", fg="#f39c12")
+        self.mini_balance.config(text=f"¥{s['balance']:.2f}", fg="#2ecc71")
+        self.mini_cache.config(text=_fmt_rate(today.get("cache_rate")), fg="#26c6da")
+        self.mini_time.config(text=time.strftime("%H:%M"))
+        self.var_status.set("更新于 " + time.strftime("%H:%M:%S"))
+        if self.mini_mode:
+            self.root.update_idletasks()
+            w = self.mini_frame.winfo_reqwidth() + 30
+            self.root.geometry(f"{max(w, 320)}x40")  # 数字变长时自适应宽度
+
+    def _on_refresh_error(self, e, manual):
+        self.var_status.set("错误: " + str(e)[:60])
+        self.mini_today.config(fg="#777")   # 数据过期置灰
+        self.mini_balance.config(fg="#777")
+        self.mini_cache.config(fg="#777")
+        if manual:  # 自动刷新失败只置灰, 不弹窗打扰
+            messagebox.showerror("获取失败", str(e))
 
     def _fill_table(self, rows):
         self._rows = list(rows)
@@ -466,10 +502,10 @@ class UsageApp:
         if tok:
             ds_api.save_token(tok)
             self.var_status.set("已自动从 Chrome 读取 Token")
-            self.refresh()
+            self.refresh(manual=True)
             messagebox.showinfo("登录成功", "已自动获取登录态，开始显示用量数据")
             return
-        if self._poll_attempt < 15:  # 最多 15 次 * 2s = 30s
+        if self._poll_attempt < 15:  # 首次 3s + 最多 14 次 * 2s ≈ 30s
             self.var_status.set(f"等待登录完成... ({self._poll_attempt}/15)")
             self.root.after(2000, self._poll_token)
         else:
@@ -481,14 +517,14 @@ class UsageApp:
         if tok:
             ds_api.save_token(tok.strip())
             self.var_status.set("Token 已更新")
-            self.refresh()
+            self.refresh(manual=True)
 
     def update_token(self):
         auto = self._find_valid_from_chrome()
         if auto:
             ds_api.save_token(auto)
             self.var_status.set("已自动从 Chrome 读取 Token")
-            self.refresh()
+            self.refresh(manual=True)
             return
         if messagebox.askyesno("引导登录", "未在 Chrome 中找到有效登录态。\n将打开 DeepSeek 官网，请在浏览器中登录。\n\n点『是』自动打开并检测；点『否』手动粘贴 Token。"):
             self._guide_login()
@@ -496,11 +532,19 @@ class UsageApp:
             self._manual_token()
 
     def snapshot(self):
-        """记录当前余额/累计消费到本地 JSON, 供趋势参考"""
+        """记录当前余额/累计消费到本地 JSON, 供趋势参考 (网络请求放后台线程)"""
+        def worker():
+            try:
+                s = ds_api.get_summary(ds_api.load_token())
+                rec = {"time": int(time.time()), "date": time.strftime("%Y-%m-%d %H:%M"),
+                       "balance": round(s["balance"], 4), "total_cost": round(s["total_cost"], 4)}
+                self.root.after(0, lambda: self._save_snapshot(rec))
+            except Exception as e:
+                self.root.after(0, lambda: messagebox.showerror("快照失败", str(e)))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _save_snapshot(self, rec):
         try:
-            s = ds_api.get_summary(ds_api.load_token())
-            rec = {"time": int(time.time()), "date": time.strftime("%Y-%m-%d %H:%M"),
-                   "balance": round(s["balance"], 4), "total_cost": round(s["total_cost"], 4)}
             hist = []
             if HISTORY_FILE.exists():
                 hist = json.loads(HISTORY_FILE.read_text(encoding="utf-8"))
@@ -521,13 +565,13 @@ def main():
             return
     except Exception:
         pass
-    root = tk.Tk()
-    # Windows 下设置 DPI 感知, 字体更清晰
+    # Windows 下设置 DPI 感知, 字体更清晰 (须在创建窗口前设置才生效)
     try:
         from ctypes import windll
         windll.shcore.SetProcessDpiAwareness(1)
     except Exception:
         pass
+    root = tk.Tk()
     UsageApp(root)
     root.mainloop()
 

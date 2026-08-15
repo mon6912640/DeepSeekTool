@@ -116,13 +116,14 @@ def get_valid_token() -> str:
             return cand
         except ApiError:
             continue
-    return load_token()  # 都失败则返回原值, 由调用方提示
+    return ""  # 全部失败返回空串 (原 token 已确认失效, 不应再返回), 由调用方走引导登录
 
 
 def _day_range(days: int = 30) -> tuple:
-    """返回 [start, end) 天对齐时间戳, end 为 GMT+8 今天零点"""
+    """返回 [start, end) 天对齐时间戳, end 为 GMT+8 明天零点
+    (即窗口含今天, 与"近N天"的直觉一致; 明细表/近30天卡片因此与今日消费口径衔接)"""
     now = int(time.time())
-    end = (now + TZ) // DAY * DAY - TZ
+    end = (now + TZ) // DAY * DAY - TZ + DAY
     start = end - days * DAY
     return start, end
 
@@ -157,7 +158,8 @@ def get_usage(token: str, days: int = 30, start: int = None, end: int = None) ->
     cost_j = _get(f"{BASE}/api/v0/usage/by_api_key/cost?start={start}&end={end}&tz={TZ}", token)
     amount_j = _get(f"{BASE}/api/v0/usage/by_api_key/amount?start={start}&end={end}&tz={TZ}", token)
     if cost_j.get("code") != 0 or amount_j.get("code") != 0:
-        raise ApiError("获取用量失败: " + cost_j.get("msg") or amount_j.get("msg") or "未知错误")
+        msg = cost_j.get("msg") or amount_j.get("msg") or "未知错误"
+        raise ApiError("获取用量失败: " + str(msg))
 
     cost_biz = cost_j["data"]["biz_data"]
     amount_biz = amount_j["data"]["biz_data"]
@@ -228,4 +230,5 @@ if __name__ == "__main__":
         u = get_usage(tok)
         print("近30天 消费:", round(u["total_cost"], 4), "请求:", u["total_requests"], "tokens:", u["total_tokens"])
         for r in u["rows"]:
-            print(f"  {r['api_name']} | {r['model']} | ¥{r['cost']:.4f} | {r['requests']}次 | {r['tokens']}tok")
+            # 控制台可能为 GBK 编码, 不用 ¥ 符号避免 UnicodeEncodeError
+            print(f"  {r['api_name']} | {r['model']} | {r['cost']:.4f}元 | {r['requests']}次 | {r['tokens']}tok")
